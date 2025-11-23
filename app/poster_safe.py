@@ -15,8 +15,10 @@ from .logger import logger
 from .rate_limit import RateLimitWrapper, RateLimitException
 from .safety_enhanced import passes_safety, get_safety_flags
 from .audit_db import get_audit_db
+from .quota import get_quota_manager
 
 audit_db = get_audit_db()
+quota_manager = get_quota_manager()
 
 
 class SafePoster:
@@ -74,10 +76,20 @@ class SafePoster:
         conn_audit.close()
         
         # Step 3: Decide posting action
-        if not passed_safety or force_review:
-            reason = 'safety_check_failed' if not passed_safety else 'forced_review'
-            audit_db.queue_for_review(draft_id, reason=reason, priority='normal')
+        if not passed_safety:
+            audit_db.queue_for_review(draft_id, reason='safety_check_failed', priority='normal')
             logger.info(f'[Draft {draft_id}] Queued for manual review')
+            return None, False
+
+        can_post, quota_reason = quota_manager.can_post()
+        if not can_post:
+            audit_db.queue_for_review(draft_id, reason=quota_reason, priority='low')
+            logger.info(f'[Draft {draft_id}] Post deferred: {quota_reason}')
+            return None, False
+
+        if force_review:
+            audit_db.queue_for_review(draft_id, reason='owner_approval_required', priority='high')
+            logger.info(f'[Draft {draft_id}] Awaiting manual approval before posting')
             return None, False
         
         # Step 4: Check DRY_RUN mode
@@ -104,6 +116,7 @@ class SafePoster:
             # Log posted tweet
             audit_db.log_posted_tweet(draft_id, str(tweet_id), text)
             logger.info(f'[Draft {draft_id}] ✓ Posted to Twitter: {tweet_id}')
+            quota_manager.record_post()
             
             return str(tweet_id), True
             
@@ -133,7 +146,9 @@ class SafePoster:
         text: str,
         in_reply_to_tweet_id: str,
         context: Optional[str] = None,
-        force_review: bool = False
+        force_review: bool = False,
+        author_id: Optional[str] = None,
+        priority: str = 'normal'
     ) -> Tuple[Optional[str], bool]:
         """
         Reply to a tweet with full safety pipeline.
@@ -166,10 +181,19 @@ class SafePoster:
         conn_audit.close()
         
         # Step 3: Check if should queue for review
-        if not passed_safety or force_review:
-            reason = 'safety_check_failed' if not passed_safety else 'forced_review'
-            audit_db.queue_for_review(draft_id, reason=reason, priority='normal')
+        if not passed_safety:
+            audit_db.queue_for_review(draft_id, reason='safety_check_failed', priority='normal')
             logger.info(f'[Draft {draft_id}] Queued for manual review')
+            return None, False
+
+        if force_review:
+            audit_db.queue_for_review(draft_id, reason='forced_review', priority='normal')
+            logger.info(f'[Draft {draft_id}] Forced review requested')
+            return None, False
+
+        can_reply, quota_reason = quota_manager.can_reply(author_id)
+        if not can_reply:
+            logger.info(f'[Draft {draft_id}] Reply skipped due to quota: {quota_reason}')
             return None, False
         
         # Step 4: Check DRY_RUN mode
@@ -188,6 +212,7 @@ class SafePoster:
             tweet_id = response.data.get('id') if hasattr(response, 'data') else response
             audit_db.log_posted_tweet(draft_id, str(tweet_id), text)
             logger.info(f'[Draft {draft_id}] ✓ Posted reply: {tweet_id}')
+            quota_manager.record_reply(author_id)
             
             return str(tweet_id), True
             

@@ -13,6 +13,7 @@ Autonomous AI-driven Twitter (X) bot for posting project updates and replying to
 - **Rate Limiting**: Automatic exponential backoff on 429 errors
 - **Multi-Layer Checks**: Profanity, financial advice, toxicity detection
 - **Manual Review Queue**: Flagged tweets queued for human approval
+- **Quota Guards**: Daily/monthly budgets plus hourly reply caps to respect API limits
 - **Audit Trail**: SQLite database logs all drafts, decisions, posts
 - **DRY-RUN Mode**: Enabled by default (no tweets posted until disabled)
 
@@ -113,6 +114,17 @@ DRY_RUN=true           # Set to false ONLY after testing
 LOG_LEVEL=INFO
 POST_INTERVAL_HOURS=3
 MENTION_POLL_MINUTES=1
+POST_JITTER_SECONDS=900
+MENTION_JITTER_SECONDS=30
+MENTION_MAX_RESULTS=20
+POSTS_PER_DAY=5
+REPLIES_PER_DAY=10
+GLOBAL_REPLIES_PER_HOUR=5
+REPLIES_PER_USER_PER_HOUR=2
+MONTHLY_WRITE_LIMIT=500
+MONTHLY_WRITE_LIMIT_DAYS=30
+REQUIRE_POST_APPROVAL=true
+BIG_ACCOUNT_FOLLOWERS=10000
 ```
 
 ### Production Secrets Management

@@ -81,6 +81,19 @@ class Config:
 
     POST_INTERVAL_HOURS = int(SecretsManager.get_secret('POST_INTERVAL_HOURS', '3'))
     MENTION_POLL_MINUTES = int(SecretsManager.get_secret('MENTION_POLL_MINUTES', '1'))
+    POST_JITTER_SECONDS = int(SecretsManager.get_secret('POST_JITTER_SECONDS', '900'))
+    MENTION_JITTER_SECONDS = int(SecretsManager.get_secret('MENTION_JITTER_SECONDS', '30'))
+    MENTION_MAX_RESULTS = int(SecretsManager.get_secret('MENTION_MAX_RESULTS', '20'))
+
+    POSTS_PER_DAY = int(SecretsManager.get_secret('POSTS_PER_DAY', '5'))
+    REPLIES_PER_DAY = int(SecretsManager.get_secret('REPLIES_PER_DAY', '10'))
+    GLOBAL_REPLIES_PER_HOUR = int(SecretsManager.get_secret('GLOBAL_REPLIES_PER_HOUR', '5'))
+    REPLIES_PER_USER_PER_HOUR = int(SecretsManager.get_secret('REPLIES_PER_USER_PER_HOUR', '2'))
+    MONTHLY_WRITE_LIMIT = int(SecretsManager.get_secret('MONTHLY_WRITE_LIMIT', '500'))
+    MONTHLY_WRITE_LIMIT_DAYS = int(SecretsManager.get_secret('MONTHLY_WRITE_LIMIT_DAYS', '30'))
+
+    REQUIRE_POST_APPROVAL = SecretsManager.get_secret('REQUIRE_POST_APPROVAL', 'true').lower() in ('1', 'true', 'yes')
+    BIG_ACCOUNT_FOLLOWERS = int(SecretsManager.get_secret('BIG_ACCOUNT_FOLLOWERS', '10000'))
 
     # ============ Runtime Flags ============
     DRY_RUN = SecretsManager.get_secret('DRY_RUN', 'true').lower() in ('1', 'true', 'yes')

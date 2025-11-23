@@ -2,9 +2,12 @@ import signal
 from .scheduler import BotScheduler
 from .logger import logger
 from .config import Config
+from app.src.db import init_db
 
 
 def main():
+    # Ensure the lite audit DB used by helper utilities is initialized.
+    init_db()
     # Validate configuration before startup
     if not Config.validate():
         logger.error('Configuration validation failed. Please check your .env file or secret store.')

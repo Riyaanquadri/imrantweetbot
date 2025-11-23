@@ -73,9 +73,10 @@ class LLMProvider:
             "Keep the tweet within 280 characters. Add 'Not financial advice.' when relevant."
         )
         user = (
-            f"Draft a {tone} tweet (single tweet) summarizing the following context for followers who track the project:\n\n"
+            f"Draft a {tone} tweet-length update as TWO short paragraphs (separated by a blank line) about this project context:\n\n"
             f"{context}\n\n"
-            "Be precise and avoid sensational language. Do NOT include private or leaked info. "
+            "Format guidance: break each paragraph into roughly five newline-separated lines so the whole tweet has ~10 compact lines. "
+            "Stay under 280 characters, make every line useful, and avoid emojis. Close with 'Not financial advice.' when appropriate. "
             "If the context includes a claim about price or returns, refuse to state it and instead advise to check official sources."
         )
 
