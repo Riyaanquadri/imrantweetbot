@@ -1,14 +1,14 @@
 from apscheduler.schedulers.background import BackgroundScheduler
 from .logger import logger
 from .llm_provider import LLMProvider
-from .poster import Poster
+from .poster_safe import SafePoster
 from .config import Config
 import time
 
 class BotScheduler:
     def __init__(self):
         self.llm = LLMProvider()
-        self.poster = Poster()
+        self.poster = SafePoster()
         self.scheduler = BackgroundScheduler()
 
     def start(self):
@@ -23,7 +23,7 @@ class BotScheduler:
         # Build context: in production read feeds, on-chain data, github commits
         context = 'Project update: commits + testnet activity'
         tweet = self.llm.generate_tweet(context)
-        self.poster.post(tweet)
+        self.poster.post(tweet, context=context)
 
     def mention_job(self):
         # Simple mentions poll: fetch mentions and reply when keywords match
@@ -43,7 +43,7 @@ class BotScheduler:
                     user = self.poster.client.get_user(id=mention.author_id)
                     username = getattr(user.data, 'username', '')
                     reply_text = f"@{username} {reply}"
-                    self.poster.reply(reply_text, tid)
+                    self.poster.reply(reply_text, tid, context=f'mention_reply:{tid}')
         except Exception:
             logger.exception('Error in mention_job')
 
