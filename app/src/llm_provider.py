@@ -1,7 +1,7 @@
 """
-OpenAI-backed LLM provider.
+Groq-backed LLM provider.
 
-This implementation uses the OpenAI Chat Completions API (openai package).
+This implementation uses the Groq Chat Completions API via OpenAI-compatible client.
 It provides two main methods:
  - generate_tweet(context, tone): returns a tweet-ready string <= 280 chars
  - generate_reply(mention_text): returns a reply-ready string <= 280 chars
@@ -10,46 +10,43 @@ Important safety notes (you must enforce in production):
  - Always run a safety classifier on generated text before posting (the project has a minimal safety module).
  - Use temperature=0.3-0.8 depending on desired creativity. Lower reduces hallucination risk.
  - Keep prompts focused and include explicit "no financial advice" instructions.
-
-Replace MODEL with your preferred OpenAI chat model that you have access to (gpt-4o-mini, gpt-4o, gpt-4, gpt-3.5-turbo, etc.).
 """
 from typing import Optional
-import openai
+from openai import OpenAI, APIConnectionError
 import time
-from .config import Config
-from .logger import logger
-
-# Configure OpenAI API key
-openai.api_key = Config.OPENAI_API_KEY
-
-# Default model - change if needed
-MODEL = "gpt-4o-mini" if True else "gpt-3.5-turbo"
+from app.config import Config
+from app.src.logger import logger
 
 class LLMProvider:
-    def __init__(self, model: str = MODEL, temperature: float = 0.5):
-        self.model = model
-        self.temperature = temperature
+    def __init__(self, model: Optional[str] = None, temperature: Optional[float] = None):
+        self.model = model or Config.GROQ_MODEL
+        self.temperature = temperature if temperature is not None else Config.LLM_TEMPERATURE
+        
+        # Initialize Groq client with OpenAI-compatible interface
+        self.client = OpenAI(
+            api_key=Config.GROQ_API_KEY,
+            base_url=Config.GROQ_BASE_URL
+        )
 
-    def _call_openai(self, messages, max_tokens=150, retry=2, backoff=1.5):
-        """Call OpenAI chat completion with minimal retry/backoff."""
+    def _call_groq(self, messages, max_tokens=150, retry=3, backoff=1.5):
+        """Call Groq chat completion with minimal retry/backoff."""
         for attempt in range(retry + 1):
             try:
-                resp = openai.ChatCompletion.create(
+                resp = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
                     max_tokens=max_tokens,
                     temperature=self.temperature,
                     n=1,
                 )
-                # The response text may be in different places depending on model wrapper
                 return resp.choices[0].message.content.strip()
-            except Exception as e:
-                logger.warning('OpenAI call failed (attempt %s): %s', attempt + 1, str(e))
+            except (APIConnectionError, Exception) as e:
+                logger.warning('Groq call failed (attempt %s): %s', attempt + 1, str(e))
                 if attempt < retry:
                     sleep_for = backoff ** (attempt + 1)
                     time.sleep(sleep_for)
                 else:
-                    logger.exception('OpenAI calls exhausted')
+                    logger.exception('Groq calls exhausted')
                     raise
 
     def _truncate_to_tweet(self, text: str) -> str:
@@ -63,7 +60,7 @@ class LLMProvider:
         return (trunc[:277] + '...').strip()
 
     def generate_tweet(self, context: str, tone: str = 'concise') -> str:
-        """Generate a single tweet (<=280 chars) using OpenAI.
+        """Generate a single tweet (<=280 chars) using Groq.
 
         The prompt explicitly forbids giving financial advice and asks for concise, factual language.
         """
@@ -73,10 +70,9 @@ class LLMProvider:
             "Keep the tweet within 280 characters. Add 'Not financial advice.' when relevant."
         )
         user = (
-            f"Draft a {tone} tweet-length update as TWO short paragraphs (separated by a blank line) about this project context:\n\n"
+            f"Draft a {tone} tweet-length update about this project context:\n\n"
             f"{context}\n\n"
-            "Format guidance: break each paragraph into roughly five newline-separated lines so the whole tweet has ~10 compact lines. "
-            "Stay under 280 characters, make every line useful, and avoid emojis. Close with 'Not financial advice.' when appropriate. "
+            "Stay under 280 characters, be factual, and avoid emojis. Close with 'Not financial advice.' when appropriate. "
             "If the context includes a claim about price or returns, refuse to state it and instead advise to check official sources."
         )
 
@@ -86,9 +82,9 @@ class LLMProvider:
         ]
 
         try:
-            out = self._call_openai(messages, max_tokens=120)
+            out = self._call_groq(messages, max_tokens=120)
         except Exception:
-            logger.exception('OpenAI failed; falling back to template')
+            logger.exception('Groq failed; falling back to template')
             return self._truncate_to_tweet(f"Update: {context} — follow official channels. Not financial advice.")
 
         tweet = self._truncate_to_tweet(out.replace('\n', ' '))
@@ -114,9 +110,9 @@ class LLMProvider:
         ]
 
         try:
-            out = self._call_openai(messages, max_tokens=120)
+            out = self._call_groq(messages, max_tokens=120)
         except Exception:
-            logger.exception('OpenAI failed for reply; falling back to template')
+            logger.exception('Groq failed for reply; falling back to template')
             return self._truncate_to_tweet(f"Thanks for the mention! We appreciate your interest. Not financial advice.")
 
         reply = self._truncate_to_tweet(out.replace('\n', ' '))
