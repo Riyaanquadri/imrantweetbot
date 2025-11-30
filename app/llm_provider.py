@@ -1,115 +1,120 @@
-# app/src/llm_provider.py
 """
-Groq-backed LLM provider for tweet generation and replies.
+Groq-backed LLM provider.
 
-Uses the official groq.Client (sync). Keeps prompts explicit, low-temp defaults,
-and a small retry/backoff for resilience.
+This implementation uses the Groq Chat Completions API via OpenAI-compatible client.
+It provides two main methods:
+ - generate_tweet(context, tone): returns a tweet-ready string <= 280 chars
+ - generate_reply(mention_text): returns a reply-ready string <= 280 chars
+
+Important safety notes (you must enforce in production):
+ - Always run a safety classifier on generated text before posting (the project has a minimal safety module).
+ - Use temperature=0.3-0.8 depending on desired creativity. Lower reduces hallucination risk.
+ - Keep prompts focused and include explicit "no financial advice" instructions.
 """
-
-import os
-import time
-import logging
 from typing import Optional
-from groq import Client
+from openai import OpenAI, APIConnectionError
+import time
 from .config import Config
 from .logger import logger
-from .rate_limit import interruptible_sleep
-
-# Read config from env/config
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "gpt-oss-120b")
-GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
-TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", Config.POST_INTERVAL_HOURS)) if False else float(os.getenv("LLM_TEMPERATURE", "0.45"))
-MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "300"))
-
-# Build client
-_client = None
-def _get_client():
-    global _client
-    if _client is None:
-        if not GROQ_API_KEY:
-            raise RuntimeError("GROQ_API_KEY not set in environment")
-        _client = Client(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
-    return _client
-
-def _call_groq_chat(messages, max_tokens=MAX_TOKENS, temperature=TEMPERATURE, retries=2, backoff=1.5):
-    """Call Groq chat completions with simple retry/backoff. Returns text."""
-    client = _get_client()
-    for attempt in range(retries + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            # Groq returns choices like OpenAI style
-            if resp and getattr(resp, "choices", None):
-                return resp.choices[0].message.content.strip()
-            # Some endpoints may return text directly
-            if hasattr(resp, "text"):
-                return resp.text.strip()
-            return str(resp)
-        except Exception as e:
-            logger.warning("Groq call failed (attempt %s): %s", attempt + 1, str(e))
-            if attempt < retries:
-                sleep_time = backoff ** (attempt + 1)
-                if not interruptible_sleep(sleep_time):
-                    raise KeyboardInterrupt('Shutdown during Groq API retry')
-            else:
-                logger.exception("Groq retries exhausted")
-                raise
-
-def _truncate_to_tweet(text: str) -> str:
-    if len(text) <= 280:
-        return text
-    trunc = text[:275]
-    last_sent = trunc.rsplit('.', 1)[0]
-    if last_sent and len(last_sent) > 50:
-        return (last_sent + '.').strip()[:280]
-    return (trunc[:277] + '...').strip()
 
 class LLMProvider:
     def __init__(self, model: Optional[str] = None, temperature: Optional[float] = None):
-        self.model = model or GROQ_MODEL
-        self.temperature = temperature if temperature is not None else TEMPERATURE
+        self.model = model or Config.GROQ_MODEL
+        self.temperature = temperature if temperature is not None else Config.LLM_TEMPERATURE
+        
+        # Initialize Groq client with OpenAI-compatible interface
+        # Use Groq's OpenAI-compatible endpoint directly
+        self.client = OpenAI(
+            api_key=Config.GROQ_API_KEY,
+            base_url=Config.GROQ_BASE_URL
+        )
+
+    def _call_groq(self, messages, max_tokens=150, retry=3, backoff=1.5):
+        """Call Groq chat completion with minimal retry/backoff."""
+        for attempt in range(retry + 1):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=self.temperature,
+                    n=1,
+                )
+                return resp.choices[0].message.content.strip()
+            except (APIConnectionError, Exception) as e:
+                logger.warning('Groq call failed (attempt %s): %s', attempt + 1, str(e))
+                if attempt < retry:
+                    sleep_for = backoff ** (attempt + 1)
+                    time.sleep(sleep_for)
+                else:
+                    logger.exception('Groq calls exhausted')
+                    raise
+
+    def _truncate_to_tweet(self, text: str) -> str:
+        if len(text) <= 280:
+            return text
+        # prefer truncating to last sentence boundary before 275 chars
+        trunc = text[:275]
+        last_sent = trunc.rsplit('.', 1)[0]
+        if last_sent and len(last_sent) > 50:
+            return (last_sent + '.').strip()[:280]
+        return (trunc[:277] + '...').strip()
 
     def generate_tweet(self, context: str, tone: str = 'concise') -> str:
-        """
-        Generate a single tweet (<= 280 chars). The prompt explicitly forbids
-        giving financial advice and asks for concise factual wording.
+        """Generate a single tweet (<=280 chars) using Groq.
+
+        The prompt explicitly forbids giving financial advice and asks for concise, factual language.
         """
         system = (
-            "You are a concise assistant that drafts short (<=280 chars) tweets "
-            "about crypto projects. Do NOT provide financial advice, do NOT give "
-            "trading signals, and avoid unverifiable claims. Keep language factual."
+            "You are an assistant that drafts short, factual, and clear tweets about crypto projects. "
+            "You must NOT provide financial advice or recommendations, and you must not make unverifiable claims. "
+            "Keep the tweet within 280 characters. Add 'Not financial advice.' when relevant."
         )
         user = (
-            f"Context:\n{context}\n\n"
-            "Task: Draft one concise tweet (single tweet, no threads) summarizing the above. "
-            "If context includes pricing/returns claims, refuse to restate them and say 'check official sources'. "
-            "End with 'Not financial advice.' if the tweet references investments."
+            f"Draft a {tone} tweet-length update about this project context:\n\n"
+            f"{context}\n\n"
+            "Stay under 280 characters, be factual, and avoid emojis. Close with 'Not financial advice.' when appropriate. "
+            "If the context includes a claim about price or returns, refuse to state it and instead advise to check official sources."
         )
-        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        out = _call_groq_chat(messages, max_tokens=120, temperature=self.temperature)
-        return _truncate_to_tweet(out.replace("\n", " "))
+
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user}
+        ]
+
+        try:
+            out = self._call_groq(messages, max_tokens=120)
+        except Exception:
+            logger.exception('Groq failed; falling back to template')
+            return self._truncate_to_tweet(f"Update: {context} — follow official channels. Not financial advice.")
+
+        tweet = self._truncate_to_tweet(out.replace('\n', ' '))
+        return tweet
 
     def generate_reply(self, mention_text: str, tone: str = 'helpful') -> str:
-        """
-        Generate a concise reply (<=280 chars). Do not include URLs unless provided.
+        """Generate a reply to a mention.
+
+        We include the mention's text in the prompt and ask for a concise, polite response. Replies should not be longer than 280 chars.
         """
         system = (
-            "You are a polite assistant that composes short Twitter replies about crypto projects. "
-            "Do NOT provide investment advice or make claims about guaranteed returns."
+            "You are an assistant that composes polite, concise Twitter replies about crypto projects. "
+            "Do NOT provide investment advice or make claims about guaranteed returns. Keep within 280 characters."
         )
         user = (
-            f"Compose a {tone} reply to the mention below. Be concise, acknowledge the user, and offer a pointer to official channels when relevant.\n\n"
-            f"Mention: \"{mention_text}\""
+            f"Compose a {tone} reply to this mention while being factual and concise. Include a short acknowledgement and a useful pointer if appropriate. "
+            f"Mention text: \"{mention_text}\"\n\n"
+            "Do not include any URLs unless explicitly supplied."
         )
-        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        out = _call_groq_chat(messages, max_tokens=120, temperature=self.temperature)
-        return _truncate_to_tweet(out.replace("\n", " "))
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user}
+        ]
 
-# simple convenience for compatibility with previous code
-def make_provider():
-    return LLMProvider()
+        try:
+            out = self._call_groq(messages, max_tokens=120)
+        except Exception:
+            logger.exception('Groq failed for reply; falling back to template')
+            return self._truncate_to_tweet(f"Thanks for the mention! We appreciate your interest. Not financial advice.")
+
+        reply = self._truncate_to_tweet(out.replace('\n', ' '))
+        return reply

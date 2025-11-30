@@ -1,28 +1,50 @@
-from apscheduler.schedulers.background import BackgroundScheduler
+import os
+import random
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
-from .logger import logger
-from .llm_provider import LLMProvider
-from .poster_safe import SafePoster
+from apscheduler.schedulers.background import BackgroundScheduler
+
 from .config import Config
+from .llm_provider import LLMProvider
+from .logger import logger
+from .poster_safe import SafePoster
 from .quota import get_quota_manager
 
+
+def choose_ab_variant() -> str:
+    """Pick a variant from AB_VARIANTS env list; fallback to default."""
+    raw = os.getenv("AB_VARIANTS", "control").split(",")
+    variants = [variant.strip() for variant in raw if variant.strip()]
+    if not variants:
+        return os.getenv("AB_DEFAULT_VARIANT", "control")
+    return random.choice(variants)
+
 class BotScheduler:
-    def __init__(self):
+    def __init__(self, twitter_client=None, quota_manager=None):
         self.llm = LLMProvider()
-        self.poster = SafePoster()
+        self.poster = SafePoster(twitter_client=twitter_client)
         self.scheduler = BackgroundScheduler()
-        self.quota = get_quota_manager()
+        self.quota = quota_manager or get_quota_manager()
+        self.ab_variant_tones = Config.AB_VARIANT_TONES
 
     def start(self):
-        # Post job
+        # Post job - use POST_INTERVAL_MINUTES if available, else POST_INTERVAL_HOURS
+        post_interval = {}
+        if hasattr(Config, 'POST_INTERVAL_MINUTES') and Config.POST_INTERVAL_MINUTES:
+            post_interval['minutes'] = Config.POST_INTERVAL_MINUTES
+        else:
+            post_interval['hours'] = Config.POST_INTERVAL_HOURS
+        
         self.scheduler.add_job(
             self.post_job,
             'interval',
-            hours=Config.POST_INTERVAL_HOURS,
+            **post_interval,
             id='post_job',
-            jitter=max(Config.POST_JITTER_SECONDS, 0)
+            jitter=max(Config.POST_JITTER_SECONDS, 0),
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=300
         )
         # Mention poll job
         self.scheduler.add_job(
@@ -30,7 +52,10 @@ class BotScheduler:
             'interval',
             minutes=Config.MENTION_POLL_MINUTES,
             id='mention_job',
-            jitter=max(Config.MENTION_JITTER_SECONDS, 0)
+            jitter=max(Config.MENTION_JITTER_SECONDS, 0),
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=300
         )
         self.scheduler.start()
         logger.info('Scheduler started')
@@ -42,8 +67,17 @@ class BotScheduler:
             logger.info('Skipping post job: %s', reason)
             return
         context = 'Project update: commits + testnet activity'
-        tweet = self.llm.generate_tweet(context)
-        self.poster.post(tweet, context=context, force_review=Config.REQUIRE_POST_APPROVAL)
+        variant = choose_ab_variant() if Config.AB_TEST_ENABLED else os.getenv('AB_DEFAULT_VARIANT', 'control')
+        tone = self.ab_variant_tones.get(variant, 'concise') if variant else 'concise'
+        if variant:
+            logger.info('Selected A/B variant %s (tone=%s)', variant, tone)
+        tweet = self.llm.generate_tweet(context, tone=tone)
+        self.poster.post(
+            tweet,
+            context=context,
+            force_review=Config.REQUIRE_POST_APPROVAL,
+            ab_variant=variant
+        )
 
     def mention_job(self):
         # Simple mentions poll: fetch mentions and reply when keywords match
@@ -133,7 +167,8 @@ class BotScheduler:
                     entry['mention'].id,
                     context=f"mention_reply:{entry['mention'].id}",
                     author_id=author_id,
-                    priority='high' if entry['is_big'] else 'normal'
+                    priority='high' if entry['is_big'] else 'normal',
+                    ab_variant=None
                 )
         except Exception:
             logger.exception('Error in mention_job')

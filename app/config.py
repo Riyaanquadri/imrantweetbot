@@ -83,6 +83,32 @@ class Config:
     GROQ_BASE_URL = SecretsManager.get_secret('GROQ_BASE_URL', 'https://api.groq.com/openai/v1')
     LLM_TEMPERATURE = float(SecretsManager.get_secret('LLM_TEMPERATURE', '0.45'))
     LLM_MAX_TOKENS = int(SecretsManager.get_secret('LLM_MAX_TOKENS', '300'))
+    ENABLE_RAG = SecretsManager.get_secret('ENABLE_RAG', 'false').lower() in ('1', 'true', 'yes')
+    RAG_INDEX_PATH = SecretsManager.get_secret('RAG_INDEX_PATH', 'data/rag_index.pkl')
+    RAG_TOP_K = int(SecretsManager.get_secret('RAG_TOP_K', '3'))
+    AB_TEST_ENABLED = SecretsManager.get_secret('AB_TEST_ENABLED', 'false').lower() in ('1', 'true', 'yes')
+    AB_VARIANTS = [
+        variant.strip()
+        for variant in SecretsManager.get_secret('AB_VARIANTS', '').split(',')
+        if variant.strip()
+    ]
+    AB_DEFAULT_VARIANT = SecretsManager.get_secret(
+        'AB_DEFAULT_VARIANT',
+        AB_VARIANTS[0] if AB_VARIANTS else 'control'
+    )
+
+    _raw_variant_tones = SecretsManager.get_secret('AB_VARIANT_TONES', '')
+    AB_VARIANT_TONES = {}
+    for pair in _raw_variant_tones.split(','):
+        if ':' not in pair:
+            continue
+        key, value = pair.split(':', 1)
+        key = key.strip()
+        value = value.strip()
+        if key and value:
+            AB_VARIANT_TONES[key] = value
+    if AB_DEFAULT_VARIANT and AB_DEFAULT_VARIANT not in AB_VARIANT_TONES:
+        AB_VARIANT_TONES[AB_DEFAULT_VARIANT] = 'concise'
 
     # ============ Bot Configuration ============
     BOT_HANDLE = SecretsManager.get_secret('BOT_HANDLE', 'bot')
@@ -92,6 +118,7 @@ class Config:
     ]
 
     POST_INTERVAL_HOURS = int(SecretsManager.get_secret('POST_INTERVAL_HOURS', '3'))
+    POST_INTERVAL_MINUTES = int(SecretsManager.get_secret('POST_INTERVAL_MINUTES', '0') or '0')
     MENTION_POLL_MINUTES = int(SecretsManager.get_secret('MENTION_POLL_MINUTES', '1'))
     POST_JITTER_SECONDS = int(SecretsManager.get_secret('POST_JITTER_SECONDS', '900'))
     MENTION_JITTER_SECONDS = int(SecretsManager.get_secret('MENTION_JITTER_SECONDS', '30'))

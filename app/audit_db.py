@@ -1,54 +1,79 @@
-"""
-Persistent audit log and manual review queue for generated tweets.
+"""Concurrency-safe SQLite audit log helper."""
+from __future__ import annotations
 
-Stores all drafts, safety checks, and posting decisions in SQLite for:
-- Debugging
-- Compliance
-- Manual review queuing
-- Historical analysis
-
-Schema:
-- drafts: Generated tweet content
-- safety_checks: Safety check results
-- posts: Posted tweets
-"""
-import sqlite3
 import json
+import os
+import sqlite3
+import threading
+import time
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Any, Dict, List, Optional
+
+from .config import Config
 from .logger import logger
 
-DB_PATH = 'bot_audit.db'
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+DB_PATH = os.path.join(BASE_DIR, 'bot_audit.db')
+_write_lock = threading.Lock()
+
+
+def _connect(db_path: str = DB_PATH) -> sqlite3.Connection:
+    """Create SQLite connection with WAL + busy timeout ready."""
+    conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    # Defensive PRAGMAs (no-op if already set globally)
+    try:
+        conn.execute('PRAGMA journal_mode=WAL;')
+    except sqlite3.OperationalError:
+        pass
+    conn.execute('PRAGMA busy_timeout=5000;')
+    return conn
+
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    return any(row[1] == column for row in cur.fetchall())
+
+
+def _with_retry(fn, max_retries: int = 6, base_delay: float = 0.05):
+    """Retry helper to survive short write contentions."""
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            if 'database is locked' in msg or 'database table is locked' in msg:
+                sleep_for = base_delay * (2 ** attempt)
+                time.sleep(sleep_for)
+                continue
+            raise
+    return fn()
 
 
 class AuditDB:
-    """SQLite-based audit log and manual review queue."""
-    
+    """SQLite-based audit log and manual review queue with locking."""
+
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
         self._init_db()
-    
-    def _get_connection(self) -> sqlite3.Connection:
-        """Get database connection with row factory."""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-    
+
+    def _get_connection(self):
+        """Backward-compatible accessor for legacy callers."""
+        return _connect(self.db_path)
+
     def _init_db(self):
-        """Initialize database schema."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        
-        # Drafts table: Generated tweet content
-        cursor.execute('''
+        conn = _connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute('''
             CREATE TABLE IF NOT EXISTS drafts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 text TEXT NOT NULL,
                 context TEXT,
                 generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                status TEXT DEFAULT 'generated',  -- generated, approved, rejected, posted
+                status TEXT DEFAULT 'generated',
                 safety_passed BOOLEAN DEFAULT 0,
-                safety_flags TEXT,  -- JSON array of flags
+                safety_flags TEXT,
                 posted_tweet_id TEXT,
                 posted_at TIMESTAMP,
                 error_message TEXT,
@@ -57,9 +82,9 @@ class AuditDB:
                 reviewed_at TIMESTAMP
             )
         ''')
-        
-        # Safety checks table: Detailed safety check results
-        cursor.execute('''
+        if not _column_exists(conn, 'drafts', 'ab_variant'):
+            cur.execute("ALTER TABLE drafts ADD COLUMN ab_variant TEXT")
+        cur.execute('''
             CREATE TABLE IF NOT EXISTS safety_checks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 draft_id INTEGER NOT NULL,
@@ -70,25 +95,21 @@ class AuditDB:
                 FOREIGN KEY (draft_id) REFERENCES drafts(id)
             )
         ''')
-        
-        # Manual review queue
-        cursor.execute('''
+        cur.execute('''
             CREATE TABLE IF NOT EXISTS review_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 draft_id INTEGER NOT NULL UNIQUE,
-                reason TEXT,  -- safety_check_failed, high_priority, etc.
-                priority TEXT DEFAULT 'normal',  -- low, normal, high
+                reason TEXT,
+                priority TEXT DEFAULT 'normal',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 reviewed BOOLEAN DEFAULT 0,
                 reviewed_at TIMESTAMP,
-                reviewer_decision TEXT,  -- approved, rejected
+                reviewer_decision TEXT,
                 reviewer_notes TEXT,
                 FOREIGN KEY (draft_id) REFERENCES drafts(id)
             )
         ''')
-        
-        # Posts table: Posted tweets for tracking
-        cursor.execute('''
+        cur.execute('''
             CREATE TABLE IF NOT EXISTS posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 draft_id INTEGER NOT NULL,
@@ -98,38 +119,58 @@ class AuditDB:
                 replies_count INTEGER DEFAULT 0,
                 likes_count INTEGER DEFAULT 0,
                 retweets_count INTEGER DEFAULT 0,
-                last_updated TIMESTAMP,
-                FOREIGN KEY (draft_id) REFERENCES drafts(id)
+                last_updated TIMESTAMP
             )
         ''')
-        
         conn.commit()
         conn.close()
-        logger.info(f'Initialized audit database at {self.db_path}')
+        logger.info('Initialized audit database at %s', self.db_path)
+
+    def _write(self, handler):
+        def run():
+            with _write_lock:
+                conn = _connect(self.db_path)
+                try:
+                    result = handler(conn)
+                    conn.commit()
+                    return result
+                finally:
+                    conn.close()
+        return _with_retry(run)
+
+    def _read(self, handler):
+        conn = _connect(self.db_path)
+        try:
+            return handler(conn)
+        finally:
+            conn.close()
     
     def log_draft(
         self,
         text: str,
         context: Optional[str] = None,
         safety_passed: bool = False,
-        safety_flags: Optional[List[str]] = None
+        safety_flags: Optional[List[str]] = None,
+        ab_variant: Optional[str] = None
     ) -> int:
         """Log a generated draft."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        
         flags_json = json.dumps(safety_flags or [])
-        cursor.execute('''
-            INSERT INTO drafts (text, context, safety_passed, safety_flags)
-            VALUES (?, ?, ?, ?)
-        ''', (text, context, safety_passed, flags_json))
-        
-        draft_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        
-        logger.debug(f'Logged draft {draft_id}: passed_safety={safety_passed}')
-        return draft_id
+        status_val = 'pending_approval' if Config.REQUIRE_POST_APPROVAL else 'queued'
+
+        def handler(conn):
+            cur = conn.cursor()
+            cur.execute(
+                '''
+                INSERT INTO drafts (text, context, status, safety_passed, safety_flags, ab_variant)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ''',
+                (text, context, status_val, int(bool(safety_passed)), flags_json, ab_variant)
+            )
+            draft_id = cur.lastrowid
+            logger.debug('Logged draft %s: status=%s safety_passed=%s', draft_id, status_val, safety_passed)
+            return draft_id
+
+        return self._write(handler)
     
     def log_safety_check(
         self,
@@ -139,16 +180,17 @@ class AuditDB:
         details: Optional[str] = None
     ):
         """Log individual safety check result."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT INTO safety_checks (draft_id, check_name, passed, details)
-            VALUES (?, ?, ?, ?)
-        ''', (draft_id, check_name, passed, details))
-        
-        conn.commit()
-        conn.close()
+        def handler(conn):
+            cur = conn.cursor()
+            cur.execute(
+                '''
+                INSERT INTO safety_checks (draft_id, check_name, passed, details)
+                VALUES (?, ?, ?, ?)
+                ''',
+                (draft_id, check_name, int(bool(passed)), details)
+            )
+
+        self._write(handler)
     
     def queue_for_review(
         self,
@@ -157,37 +199,37 @@ class AuditDB:
         priority: str = 'normal'
     ):
         """Queue a draft for manual review."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT INTO review_queue (draft_id, reason, priority)
-            VALUES (?, ?, ?)
-            ON CONFLICT(draft_id) DO UPDATE SET priority = ?
-        ''', (draft_id, reason, priority, priority))
-        
-        conn.commit()
-        conn.close()
-        
-        logger.info(f'Queued draft {draft_id} for review (reason: {reason}, priority: {priority})')
+        def handler(conn):
+            cur = conn.cursor()
+            cur.execute(
+                '''
+                INSERT INTO review_queue (draft_id, reason, priority)
+                VALUES (?, ?, ?)
+                ON CONFLICT(draft_id) DO UPDATE SET priority = excluded.priority
+                ''',
+                (draft_id, reason, priority)
+            )
+
+        self._write(handler)
+        logger.info('Queued draft %s for review (reason=%s, priority=%s)', draft_id, reason, priority)
     
     def get_review_queue(self, only_unreviewed: bool = True) -> List[Dict[str, Any]]:
         """Get drafts pending manual review."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        
-        where = "WHERE reviewed = 0" if only_unreviewed else ""
-        cursor.execute(f'''
-            SELECT rq.*, d.text, d.safety_flags
-            FROM review_queue rq
-            JOIN drafts d ON rq.draft_id = d.id
-            {where}
-            ORDER BY rq.priority DESC, rq.created_at ASC
-        ''')
-        
-        rows = [dict(row) for row in cursor.fetchall()]
-        conn.close()
-        return rows
+        def handler(conn):
+            where = "WHERE reviewed = 0" if only_unreviewed else ""
+            cur = conn.cursor()
+            cur.execute(
+                f'''
+                SELECT rq.*, d.text, d.safety_flags
+                FROM review_queue rq
+                JOIN drafts d ON rq.draft_id = d.id
+                {where}
+                ORDER BY rq.priority DESC, rq.created_at ASC
+                '''
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+        return self._read(handler)
     
     def approve_for_posting(
         self,
@@ -196,23 +238,25 @@ class AuditDB:
         notes: Optional[str] = None
     ):
         """Approve a draft for posting."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            UPDATE drafts SET status = 'approved', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        ''', (reviewer, draft_id))
-        
-        cursor.execute('''
-            UPDATE review_queue SET reviewed = 1, reviewer_decision = 'approved', reviewer_notes = ?, reviewed_at = CURRENT_TIMESTAMP
-            WHERE draft_id = ?
-        ''', (notes, draft_id))
-        
-        conn.commit()
-        conn.close()
-        
-        logger.info(f'Approved draft {draft_id} for posting')
+        def handler(conn):
+            cur = conn.cursor()
+            cur.execute(
+                '''
+                UPDATE drafts SET status = 'approved', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                ''',
+                (reviewer, draft_id)
+            )
+            cur.execute(
+                '''
+                UPDATE review_queue SET reviewed = 1, reviewer_decision = 'approved', reviewer_notes = ?, reviewed_at = CURRENT_TIMESTAMP
+                WHERE draft_id = ?
+                ''',
+                (notes, draft_id)
+            )
+
+        self._write(handler)
+        logger.info('Approved draft %s for posting', draft_id)
     
     def reject_draft(
         self,
@@ -222,23 +266,25 @@ class AuditDB:
         notes: Optional[str] = None
     ):
         """Reject a draft."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            UPDATE drafts SET status = 'rejected', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        ''', (reviewer, draft_id))
-        
-        cursor.execute('''
-            UPDATE review_queue SET reviewed = 1, reviewer_decision = 'rejected', reviewer_notes = ?, reviewed_at = CURRENT_TIMESTAMP
-            WHERE draft_id = ?
-        ''', (notes, draft_id))
-        
-        conn.commit()
-        conn.close()
-        
-        logger.info(f'Rejected draft {draft_id}: {reason}')
+        def handler(conn):
+            cur = conn.cursor()
+            cur.execute(
+                '''
+                UPDATE drafts SET status = 'rejected', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                ''',
+                (reviewer, draft_id)
+            )
+            cur.execute(
+                '''
+                UPDATE review_queue SET reviewed = 1, reviewer_decision = 'rejected', reviewer_notes = ?, reviewed_at = CURRENT_TIMESTAMP
+                WHERE draft_id = ?
+                ''',
+                (notes, draft_id)
+            )
+
+        self._write(handler)
+        logger.info('Rejected draft %s: %s', draft_id, reason)
     
     def log_posted_tweet(
         self,
@@ -247,71 +293,63 @@ class AuditDB:
         text: str
     ):
         """Log a successfully posted tweet."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            UPDATE drafts SET status = 'posted', posted_tweet_id = ?, posted_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        ''', (tweet_id, draft_id))
-        
-        cursor.execute('''
-            INSERT INTO posts (draft_id, tweet_id, text)
-            VALUES (?, ?, ?)
-        ''', (draft_id, tweet_id, text))
-        
-        conn.commit()
-        conn.close()
-        
-        logger.info(f'Logged posted tweet {tweet_id} (draft: {draft_id})')
+        def handler(conn):
+            cur = conn.cursor()
+            cur.execute(
+                '''
+                UPDATE drafts SET status = 'posted', posted_tweet_id = ?, posted_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                ''',
+                (tweet_id, draft_id)
+            )
+            cur.execute(
+                '''
+                INSERT INTO posts (draft_id, tweet_id, text)
+                VALUES (?, ?, ?)
+                ''',
+                (draft_id, tweet_id, text)
+            )
+
+        self._write(handler)
+        logger.info('Logged posted tweet %s (draft=%s)', tweet_id, draft_id)
     
     def get_stats(self) -> Dict[str, Any]:
         """Get audit log statistics."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        
-        stats = {}
-        
-        # Draft stats
-        cursor.execute('SELECT COUNT(*) FROM drafts')
-        stats['total_drafts'] = cursor.fetchone()[0]
-        
-        cursor.execute('SELECT COUNT(*) FROM drafts WHERE status = ?', ('posted',))
-        stats['posted_tweets'] = cursor.fetchone()[0]
-        
-        cursor.execute('SELECT COUNT(*) FROM drafts WHERE status = ?', ('rejected',))
-        stats['rejected_drafts'] = cursor.fetchone()[0]
-        
-        # Review queue
-        cursor.execute('SELECT COUNT(*) FROM review_queue WHERE reviewed = 0')
-        stats['pending_reviews'] = cursor.fetchone()[0]
-        
-        conn.close()
-        return stats
+        def handler(conn):
+            cur = conn.cursor()
+            stats: Dict[str, Any] = {}
+            cur.execute('SELECT COUNT(*) FROM drafts')
+            stats['total_drafts'] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM drafts WHERE status = 'posted'")
+            stats['posted_tweets'] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM drafts WHERE status = 'rejected'")
+            stats['rejected_drafts'] = cur.fetchone()[0]
+            cur.execute('SELECT COUNT(*) FROM review_queue WHERE reviewed = 0')
+            stats['pending_reviews'] = cur.fetchone()[0]
+            return stats
+
+        return self._read(handler)
     
     def export_audit_log(self, output_path: str = 'audit_export.json'):
         """Export audit log for compliance."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('SELECT * FROM drafts ORDER BY generated_at DESC')
-        drafts = [dict(row) for row in cursor.fetchall()]
-        
-        cursor.execute('SELECT * FROM posts ORDER BY posted_at DESC')
-        posts = [dict(row) for row in cursor.fetchall()]
-        
+        def handler(conn):
+            cur = conn.cursor()
+            cur.execute('SELECT * FROM drafts ORDER BY generated_at DESC')
+            drafts = [dict(row) for row in cur.fetchall()]
+            cur.execute('SELECT * FROM posts ORDER BY posted_at DESC')
+            posts = [dict(row) for row in cur.fetchall()]
+            return drafts, posts
+
+        drafts, posts = self._read(handler)
         export = {
             'exported_at': datetime.now().isoformat(),
             'drafts': drafts,
             'posts': posts,
             'stats': self.get_stats()
         }
-        
-        with open(output_path, 'w') as f:
-            json.dump(export, f, indent=2, default=str)
-        
-        conn.close()
-        logger.info(f'Exported audit log to {output_path}')
+        with open(output_path, 'w', encoding='utf-8') as file:
+            json.dump(export, file, indent=2, default=str)
+        logger.info('Exported audit log to %s', output_path)
 
 
 # Global audit DB instance

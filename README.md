@@ -125,6 +125,12 @@ MONTHLY_WRITE_LIMIT=500
 MONTHLY_WRITE_LIMIT_DAYS=30
 REQUIRE_POST_APPROVAL=true
 BIG_ACCOUNT_FOLLOWERS=10000
+
+# A/B testing (optional)
+AB_TEST_ENABLED=false
+AB_VARIANTS=control,experimental
+AB_DEFAULT_VARIANT=control
+AB_VARIANT_TONES=control:concise,experimental:authoritative
 ```
 
 ### Production Secrets Management
@@ -172,6 +178,17 @@ kubectl apply -f bot-deployment.yaml
 
 ### Systemd Service
 See `systemd/crypto-ai-bot.service` for Linux deployment.
+
+## Dataset & LLM Training Utilities
+
+- `python tools/export_tweets_to_jsonl.py --output data/dataset.jsonl` — export curated drafts/posts from `bot_audit.db` into JSONL with inferred labels for tuning.
+- `python tools/paraphrase_augment.py data/dataset.jsonl --output data/dataset_augmented.jsonl` — create multiple paraphrases per gold tweet using the Groq LLM while preserving facts.
+- `python tools/build_rag_index.py docs/ --output data/rag_index.pkl` — build a TF-IDF index over project docs; enable retrieval support by setting `ENABLE_RAG=true` and pointing `RAG_INDEX_PATH` to the generated file.
+- `python tools/prepare_finetune_dataset.py data/dataset.jsonl --output-dir data/finetune` — split/export prompt/completion JSONL files for fine-tuning.
+- `python tools/run_openai_finetune.py data/finetune/train.jsonl data/finetune/val.jsonl --model gpt-3.5-turbo` — optional helper to launch an OpenAI fine-tune job.
+- `python tools/evaluate_generations.py predictions.jsonl data/finetune/val.jsonl` — compute similarity metrics between model outputs and references (supports semantic similarity if `sentence-transformers` is installed).
+- `python tools/pull_tweet_metrics.py --limit 200` — refresh engagement (likes/retweets/replies) for posted tweets via the X API and store them in `posts`.
+- `python tools/report_engagement.py --since-days 7` — generate an A/B-friendly report summarizing per-variant engagement and duplicate skip rates.
 
 ## File Structure
 

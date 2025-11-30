@@ -1,0 +1,3 @@
+Solstice testnet processed 1.2M transactions last month with sub-second confirmation.
+Developers are focused on lowering settlement latency to ~0.4s across the relayer mesh.
+ACL rollout completed on Sepolia; audit highlights include reduced data leakage via TFHE proofs.

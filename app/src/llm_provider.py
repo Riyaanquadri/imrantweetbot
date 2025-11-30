@@ -1,119 +1,97 @@
-"""
-Groq-backed LLM provider.
+import os
+import json
+import httpx
+from typing import Optional, List
 
-This implementation uses the Groq Chat Completions API via OpenAI-compatible client.
-It provides two main methods:
- - generate_tweet(context, tone): returns a tweet-ready string <= 280 chars
- - generate_reply(mention_text): returns a reply-ready string <= 280 chars
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "gpt-oss-120b")
+DEFAULT_TEMP = float(os.getenv("LLM_TEMPERATURE", "0.6"))
+DEFAULT_TOP_P = float(os.getenv("LLM_TOP_P", "0.9"))
+DEFAULT_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "140"))
+GROQ_ENDPOINT = os.getenv("GROQ_API_URL", "https://api.groq.com/openai/v1/chat/completions")
 
-Important safety notes (you must enforce in production):
- - Always run a safety classifier on generated text before posting (the project has a minimal safety module).
- - Use temperature=0.3-0.8 depending on desired creativity. Lower reduces hallucination risk.
- - Keep prompts focused and include explicit "no financial advice" instructions.
-"""
-from typing import Optional
-from openai import OpenAI, APIConnectionError
-import time
-from app.config import Config
-from app.src.logger import logger
 
 class LLMProvider:
-    def __init__(self, model: Optional[str] = None, temperature: Optional[float] = None):
-        self.model = model or Config.GROQ_MODEL
-        self.temperature = temperature if temperature is not None else Config.LLM_TEMPERATURE
-        
-        # Initialize Groq client with OpenAI-compatible interface
-        self.client = OpenAI(
-            api_key=Config.GROQ_API_KEY,
-            base_url=Config.GROQ_BASE_URL
-        )
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
+        self.api_key = api_key or GROQ_API_KEY
+        self.model = model or GROQ_MODEL
+        if not self.api_key:
+            raise RuntimeError("GROQ_API_KEY is required in env or provided to LLMProvider")
+        self._client = httpx.Client(timeout=30.0)
 
-    def _call_groq(self, messages, max_tokens=150, retry=3, backoff=1.5):
-        """Call Groq chat completion with minimal retry/backoff."""
-        for attempt in range(retry + 1):
-            try:
-                resp = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=self.temperature,
-                    n=1,
-                )
-                return resp.choices[0].message.content.strip()
-            except (APIConnectionError, Exception) as e:
-                logger.warning('Groq call failed (attempt %s): %s', attempt + 1, str(e))
-                if attempt < retry:
-                    sleep_for = backoff ** (attempt + 1)
-                    time.sleep(sleep_for)
-                else:
-                    logger.exception('Groq calls exhausted')
-                    raise
+    def _call_chat(self, messages, temperature=DEFAULT_TEMP, top_p=DEFAULT_TOP_P, max_tokens=DEFAULT_MAX_TOKENS):
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "max_tokens": int(max_tokens),
+            "n": 1,
+        }
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        r = self._client.post(GROQ_ENDPOINT, headers=headers, json=payload)
+        r.raise_for_status()
+        return r.json()
 
-    def _truncate_to_tweet(self, text: str) -> str:
-        if len(text) <= 280:
-            return text
-        # prefer truncating to last sentence boundary before 275 chars
-        trunc = text[:275]
-        last_sent = trunc.rsplit('.', 1)[0]
-        if last_sent and len(last_sent) > 50:
-            return (last_sent + '.').strip()[:280]
-        return (trunc[:277] + '...').strip()
-
-    def generate_tweet(self, context: str, tone: str = 'concise') -> str:
-        """Generate a single tweet (<=280 chars) using Groq.
-
-        The prompt explicitly forbids giving financial advice and asks for concise, factual language.
-        """
-        system = (
-            "You are an assistant that drafts short, factual, and clear tweets about crypto projects. "
-            "You must NOT provide financial advice or recommendations, and you must not make unverifiable claims. "
-            "Keep the tweet within 280 characters. Add 'Not financial advice.' when relevant."
-        )
-        user = (
-            f"Draft a {tone} tweet-length update about this project context:\n\n"
-            f"{context}\n\n"
-            "Stay under 280 characters, be factual, and avoid emojis. Close with 'Not financial advice.' when appropriate. "
-            "If the context includes a claim about price or returns, refuse to state it and instead advise to check official sources."
-        )
-
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user}
+    def _build_prompt_messages(self, topic: str, tone: str = "concise", variant: Optional[str] = None, recent_tweets: Optional[List[str]] = None, retrieved_facts: Optional[List[str]] = None):
+        sys_lines = [
+            "You are a concise, technically accurate crypto engineer writing short high-value social posts called 'xeets'.",
+            f"Tone: {tone}",
+            "Constraints: no financial advice, avoid unverifiable claims, output ONLY the tweet text, <= 220 chars."
         ]
+        if variant:
+            sys_lines.insert(1, f"A/B variant: {variant}")
+        if retrieved_facts:
+            sys_lines.append("Relevant facts (do not hallucinate beyond these):")
+            for f in retrieved_facts[:5]:
+                sys_lines.append(f"- {f}")
+        if recent_tweets:
+            sys_lines.append("Avoid repeating these recent tweets:")
+            for t in recent_tweets[:5]:
+                sys_lines.append(f"- {t}")
 
-        try:
-            out = self._call_groq(messages, max_tokens=120)
-        except Exception:
-            logger.exception('Groq failed; falling back to template')
-            return self._truncate_to_tweet(f"Update: {context} — follow official channels. Not financial advice.")
-
-        tweet = self._truncate_to_tweet(out.replace('\n', ' '))
-        return tweet
-
-    def generate_reply(self, mention_text: str, tone: str = 'helpful') -> str:
-        """Generate a reply to a mention.
-
-        We include the mention's text in the prompt and ask for a concise, polite response. Replies should not be longer than 280 chars.
-        """
-        system = (
-            "You are an assistant that composes polite, concise Twitter replies about crypto projects. "
-            "Do NOT provide investment advice or make claims about guaranteed returns. Keep within 280 characters."
-        )
-        user = (
-            f"Compose a {tone} reply to this mention while being factual and concise. Include a short acknowledgement and a useful pointer if appropriate. "
-            f"Mention text: \"{mention_text}\"\n\n"
-            "Do not include any URLs unless explicitly supplied."
-        )
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user}
+        system = {"role": "system", "content": "\n".join(sys_lines)}
+        # small few-shot examples; swap with your best examples
+        examples = [
+            {"role": "user", "content": "TYPE: announcement\nTONE: concise\nINSTRUCTIONS: one sentence, one stat or developer action, one hashtag.\n\nTopic: Solstice commit cadence increased.\n"},
+            {"role": "assistant", "content": "Project update: recent commits and testnet activity — devs, pull the latest to test the flares module. #Solstice"},
+            {"role": "user", "content": "TYPE: advantage\nTONE: authoritative\nINSTRUCTIONS: one line, express benefit to developers, include CTA.\n\nTopic: lower settlement latency.\n"},
+            {"role": "assistant", "content": "Solstice v2 reduces settlement latency to ~0.4s (3x). Devs: upgrade nodes to v2 to gain lower confirmations. Read: docs.solstice.org #Solstice"},
         ]
+        messages = [system] + examples + [{"role": "user", "content": f"Write a single tweet about: {topic}"}]
+        return messages
 
+    def generate_tweet(self, topic: str, tone: str = "concise", variant: Optional[str] = None, recent_tweets: Optional[List[str]] = None, retrieved_facts: Optional[List[str]] = None, temperature: Optional[float] = None, top_p: Optional[float] = None, max_tokens: Optional[int] = None) -> str:
+        temp = temperature if temperature is not None else DEFAULT_TEMP
+        tp = top_p if top_p is not None else DEFAULT_TOP_P
+        mt = max_tokens if max_tokens is not None else DEFAULT_MAX_TOKENS
+        messages = self._build_prompt_messages(topic, tone=tone, variant=variant, recent_tweets=recent_tweets, retrieved_facts=retrieved_facts)
+        resp = self._call_chat(messages, temperature=temp, top_p=tp, max_tokens=mt)
         try:
-            out = self._call_groq(messages, max_tokens=120)
+            # Groq/OpenAI-like response shape
+            choice = resp.get("choices", [{}])[0]
+            content = choice.get("message", {}).get("content") or choice.get("text")
+            if content is None and "data" in resp:
+                # some wrappers return resp["data"][0]["message"]["content"]
+                data = resp["data"]
+                if isinstance(data, list) and data:
+                    content = data[0].get("message", {}).get("content")
         except Exception:
-            logger.exception('Groq failed for reply; falling back to template')
-            return self._truncate_to_tweet(f"Thanks for the mention! We appreciate your interest. Not financial advice.")
+            content = None
+        return (content or "").strip().replace("\n", " ")
 
-        reply = self._truncate_to_tweet(out.replace('\n', ' '))
-        return reply
+    def generate_paraphrase(self, text: str, temperature: Optional[float] = 0.75, top_p: Optional[float] = 0.95, max_tokens: Optional[int] = 140) -> str:
+        """
+        Produce one paraphrase of `text`. Keep facts intact; change phrasing.
+        """
+        messages = [
+            {"role":"system","content":"You are an expert paraphraser. Produce one concise paraphrase that preserves facts and meaning, <=140 chars. Output only the paraphrase."},
+            {"role":"user","content": f"Paraphrase: {text}"}
+        ]
+        resp = self._call_chat(messages, temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+        try:
+            choice = resp.get("choices", [{}])[0]
+            out = choice.get("message", {}).get("content") or choice.get("text")
+        except Exception:
+            out = None
+        return (out or "").strip().replace("\n", " ")
